@@ -50,6 +50,7 @@ frontend/
 - GUM API Controller running (usually on port 8001)
 - Python 3.6+ (for the simple server)
 - Modern web browser
+- FFMPEG installed (for image processing)
 
 ### Quick Start
 
