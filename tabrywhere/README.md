@@ -1,7 +1,7 @@
 # Tabrywhere
 
-[!WARNING]
-Heads up- this project is a massive hack that relies on PyObjC and keyboard event tapping (capturing system-wide keystrokes and injecting synthetic text) plus a bunch of other things. It's definitely a proof of concept and will probably break often.
+> [!WARNING]
+> Heads up- this project is a massive hack that relies on PyObjC and keyboard event tapping (capturing system-wide keystrokes and injecting synthetic text) plus a bunch of other things. It's definitely a proof of concept and will probably break often.
 
 ## What is this?
 
@@ -17,20 +17,15 @@ Tabrywhere is a system-wide AI autocomplete that lets you summon intelligent tex
 
 ## Setup
 
-1. Install with `uv` (or pip):
-   ```bash
-   uv sync
-   ```
-
-2. Set up your environment:
+1. Set up your environment:
    ```bash
    cp .env.example .env
    # Add your OPENAI_API_KEY and USER_NAME
    ```
 
-3. **Important**: Give the Terminal permissions in System Preferences → Security & Privacy → Accessibility
+2. **Important**: Give the Terminal permissions in System Preferences → Security & Privacy → Accessibility
 
-4. Run it:
+3. Run it:
    ```bash
    uv run python main.py
    ```
