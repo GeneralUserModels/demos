@@ -1,0 +1,14 @@
+[project]
+name = "local-mac-overlay"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = [
+  "pynput>=1.7",
+  # Quartz has a bunch of graphics/windowing APIs
+  "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+  # Accessibility APIs (AXUIElement etc.) live here on modern macOS
+  "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+  "openai>=1.106.1",
+  "dotenv>=0.9.9",
+  "gum-ai>=0.1.11",
+]
