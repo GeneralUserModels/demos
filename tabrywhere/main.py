@@ -36,8 +36,7 @@ SAVE_QUALITY = int(os.getenv("SAVE_QUALITY", "92"))  # used for jpg
 ANNOTATE_CURSOR = os.getenv("ANNOTATE_CURSOR", "1") not in ("0", "false", "False")
 USER_NAME = os.getenv("USER_NAME")
 
-# Use ZERO WIDTH SPACE as placeholder; we always clean it
-JOINER = "\u200B"  # U+200B
+JOINER = "\u2060"  # WORD JOINER (plays nice with Backspace)
 
 with open("tab_prompt.txt", "r") as f:
     TAB_PROMPT = f.read().format(USER_NAME=USER_NAME)
