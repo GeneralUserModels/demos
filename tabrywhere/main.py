@@ -384,7 +384,7 @@ def stream_worker(cancel_event: threading.Event):
     first_piece_seen_local = False
     stream =client.responses.create(
         model=MODEL, 
-        instructions=f"Respond only with the completion using the user's context. Remember to NOT repeat what is already on the screen, and to mirror the same style as {USER_NAME}'s past writing.",
+        instructions=f"Respond only with the completion for the textbox in the image. Remember to NOT repeat what is already on the screen, and to mirror the same style as {USER_NAME}'s past writing.",
         input=resolved_messages, 
         stream=True, 
     )
