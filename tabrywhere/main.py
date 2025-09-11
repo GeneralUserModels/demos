@@ -58,17 +58,43 @@ def _find_monitor_for_point(monitors, x, y):
     return monitors[1] if len(monitors) > 1 else monitors[0]
 
 def _annotate_with_cursor(img: Image.Image, mon: dict, mx: int, my: int) -> Image.Image:
-    cx = mx - mon["left"]; cy = my - mon["top"]
-    cx = max(0, min(cx, img.width - 1)); cy = max(0, min(cy, img.height - 1))
+    # Calculate cursor position relative to this monitor capture
+    cx = mx - mon["left"]
+    cy = my - mon["top"]
+    cx = max(0, min(cx, img.width - 1))
+    cy = max(0, min(cy, img.height - 1))
+
+    # Estimate DPI (pixels per inch)
+    # mss monitor info might include 'width_mm' and 'height_mm'; if not, fallback
+    width_mm = mon.get("width_mm")
+    height_mm = mon.get("height_mm")
+    if width_mm and height_mm:
+        dpi_x = mon["width"] / (width_mm / 25.4)
+        dpi_y = mon["height"] / (height_mm / 25.4)
+        dpi = (dpi_x + dpi_y) / 2
+    else:
+        dpi = 96  # fallback guess
+
+    # Scale dot radius so it's about 12 px at 96 DPI and scales proportionally
+    base_size_at_96dpi = 12
+    dot_r = int((dpi / 96) * base_size_at_96dpi)
+    outline_w = max(2, dot_r // 4)
+
     draw = ImageDraw.Draw(img, "RGBA")
-    halo_r = max(12, img.width // 150); ring_r = max(8, img.width // 220)
-    ring_w = max(3, img.width // 700); arm = max(14, img.width // 180)
-    draw.ellipse((cx - halo_r, cy - halo_r, cx + halo_r, cy + halo_r), fill=(255, 255, 255, 90))
-    draw.ellipse((cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r), outline=(255, 0, 0, 255), width=ring_w)
-    draw.line((cx - arm, cy, cx + arm, cy), fill=(255, 0, 0, 255), width=ring_w)
-    draw.line((cx, cy - arm, cx, cy + arm), fill=(255, 0, 0, 255), width=ring_w)
-    dot_r = max(2, ring_w // 2)
-    draw.ellipse((cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r), fill=(255, 0, 0, 255))
+
+    # White border
+    draw.ellipse(
+        (cx - dot_r - outline_w, cy - dot_r - outline_w,
+         cx + dot_r + outline_w, cy + dot_r + outline_w),
+        fill=(255, 255, 255, 255)
+    )
+
+    # Red center
+    draw.ellipse(
+        (cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r),
+        fill=(255, 0, 0, 255)
+    )
+
     return img
 
 def _save_image(img: Image.Image) -> str:
@@ -89,6 +115,10 @@ def capture_active_monitor_as_data_url(max_width=1600, jpeg_quality=85, annotate
         mon = _find_monitor_for_point(sct.monitors, mx, my)
         raw = sct.grab(mon)  # BGRA
         img = Image.frombytes("RGB", raw.size, raw.rgb)
+
+        if annotate_cursor:
+            img = _annotate_with_cursor(img, mon, mx, my)
+
         out_img = img
         if out_img.width > max_width:
             ratio = max_width / out_img.width
