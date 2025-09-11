@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from datetime import datetime
 from pathlib import Path
+import pdb
 
 # deps for screenshot + image encoding
 import mss
@@ -103,7 +104,7 @@ def build_messages():
     print(f"[Saved annotated screenshot] {saved_path}")
     return [
         {"role": "system", "content": "You are a concise, helpful autocomplete system. When context feels underspecified or time-bound, call the get_user_context tool before answering."},
-        {"role": "user", "content": [{"type": "text", "text": TAB_PROMPT}, {"type": "image_url", "image_url": {"url": data_url}}]},
+        {"role": "user", "content": [{"type": "input_text", "text": TAB_PROMPT}, {"type": "input_image", "image_url": data_url}]},
     ]
 
 # ------------- Keycodes / Flags -------------
@@ -238,39 +239,35 @@ def loading_spinner(first_piece_event: threading.Event, cancel_event: threading.
 # ------------- GUM init + tool definition -------------
 gum_instance: Optional[GumClass] = None
 
-TOOLS: List[Dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_user_context",
-            "description": (
-                "Retrieve contextual info for a user query within a relative time window. "
-                "Use liberally when the user intent is underspecified."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Optional lexical query (e.g., 'what I was doing in vs code'). "
-                            "Leave empty for broad context."
-                        ),
-                    },
-                    "start_hh_mm_ago": {
-                        "type": "string",
-                        "description": "Optional lower bound as 'HH:MM' ago from now (e.g., '01:00').",
-                    },
-                    "end_hh_mm_ago": {
-                        "type": "string",
-                        "description": "Optional upper bound as 'HH:MM' ago from now (e.g., '00:10').",
-                    },
-                },
-                "required": [],
+TOOLS: List[Dict[str, Any]] = [{
+    "name": "get_user_context",
+    "type": "function",
+    "description": (
+        "Retrieve contextual info for a user query within a relative time window. "
+        "Use liberally."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional lexical query (e.g., 'what I was doing in vs code'). "
+                    "Leave empty for broad context."
+                ),
+            },
+            "start_hh_mm_ago": {
+                "type": "string",
+                "description": "Optional lower bound as 'HH:MM' ago from now (e.g., '01:00').",
+            },
+            "end_hh_mm_ago": {
+                "type": "string",
+                "description": "Optional upper bound as 'HH:MM' ago from now (e.g., '00:10').",
             },
         },
+        "required": [],
     }
-]
+}]
 
 async def _init_gum_async() -> GumClass:
     gi = GumClass(USER_NAME, None)  # model=None
@@ -361,38 +358,41 @@ def stream_worker(cancel_event: threading.Event):
 
     # ---- Phase 1: resolve tools ----
     resolved_messages = list(messages)
-    max_tool_rounds = 4
-    try:
-        for _ in range(max_tool_rounds):
-            if cancel_event.is_set():
-                break
-            pre = client.chat.completions.create(model=MODEL, messages=resolved_messages, tools=TOOLS, tool_choice="auto", temperature=0.2)
-            choice = pre.choices[0]
-            msg = choice.message
-            tool_calls = getattr(msg, "tool_calls", None)
-            if tool_calls:
-                resolved_messages.append({"role": "assistant", "content": msg.content or "",
-                                          "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in tool_calls]})
-                for tc in tool_calls:
-                    name = tc.function.name
-                    args_json = tc.function.arguments or "{}"
-                    output = get_user_context_tool_call(args_json) if name == "get_user_context" else f"Unknown tool: {name}"
-                    resolved_messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-                continue
-            if msg.content:
-                resolved_messages.append({"role": "assistant", "content": msg.content})
-            break
-    except Exception as e:
-        print(f"[Tool resolution error] {e}")
+    # max_tool_rounds = 4 # disabled for now
+ 
+    pre = client.responses.create(
+        model=MODEL, 
+        input=resolved_messages, 
+        tools=TOOLS, 
+    )
+
+    resolved_messages += pre.output
+
+    for item in pre.output:
+        if item.type == "function_call":
+            if item.name == "get_user_context":
+
+                user_context = get_user_context_tool_call(item.arguments)
+                resolved_messages.append({
+                    "type": "function_call_output",
+                    "call_id": item.call_id,
+                    "output": user_context
+                })
 
     # ---- Phase 2: stream ----
     first_piece_seen_local = False
+    stream =client.responses.create(
+        model=MODEL, 
+        instructions="Respond only with the completion using the user's context. Remember to NOT repeat what is already on the screen!",
+        input=resolved_messages, 
+        stream=True, 
+    )
     try:
-        for chunk in client.chat.completions.create(model=MODEL, messages=resolved_messages, stream=True, temperature=0.2):
+        for chunk in stream:
             if cancel_event.is_set():
                 break
-            delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
+
+            piece = getattr(chunk, "delta", None)
             if not piece:
                 continue
 
