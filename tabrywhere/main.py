@@ -27,7 +27,7 @@ from gum.db_utils import get_related_observations
 load_dotenv()
 
 # ------------- Config -------------
-MODEL = os.getenv("MODEL", "gpt-4o-mini")  # change as needed
+MODEL = os.getenv("MODEL", "gpt-4.1")  # change as needed
 client = OpenAI()  # uses OPENAI_API_KEY env var
 
 # Save settings
@@ -134,7 +134,7 @@ def build_messages():
     print(f"[Saved annotated screenshot] {saved_path}")
     return [
         {"role": "system", "content": "You are a concise, helpful autocomplete system. When context feels underspecified or time-bound, call the get_user_context tool before answering."},
-        {"role": "user", "content": [{"type": "input_text", "text": TAB_PROMPT}, {"type": "input_image", "image_url": data_url}]},
+        {"role": "user", "content": [{"type": "input_image", "image_url": data_url}, {"type": "input_text", "text": TAB_PROMPT}]},
     ]
 
 # ------------- Keycodes / Flags -------------
@@ -273,8 +273,8 @@ TOOLS: List[Dict[str, Any]] = [{
     "name": "get_user_context",
     "type": "function",
     "description": (
-        "Retrieve contextual info for a user query within a relative time window. "
-        "Use liberally."
+        "Retrieve contextual info for a user query."
+        "Use liberally. Time window is only needed if the user mentions a specific time period."
     ),
     "parameters": {
         "type": "object",
@@ -283,17 +283,9 @@ TOOLS: List[Dict[str, Any]] = [{
                 "type": "string",
                 "description": (
                     "Optional lexical query (e.g., 'what I was doing in vs code'). "
-                    "Leave empty for broad context."
+                    "Leave empty for broad context. Note that is is a BM25 index, it's NOT semantic search."
                 ),
-            },
-            "start_hh_mm_ago": {
-                "type": "string",
-                "description": "Optional lower bound as 'HH:MM' ago from now (e.g., '01:00').",
-            },
-            "end_hh_mm_ago": {
-                "type": "string",
-                "description": "Optional upper bound as 'HH:MM' ago from now (e.g., '00:10').",
-            },
+            }
         },
         "required": [],
     }
@@ -410,11 +402,24 @@ def stream_worker(cancel_event: threading.Event):
                     "output": user_context
                 })
 
+
+    instructions = f"""Respond with a helpful continuation for the textbox in the image."""
+
+    resolved_messages.append({
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": instructions
+            }
+        ]
+    })
+
+
     # ---- Phase 2: stream ----
     first_piece_seen_local = False
     stream =client.responses.create(
         model=MODEL, 
-        instructions=f"Respond only with the completion for the textbox in the image. Remember to NOT repeat what is already on the screen, and to mirror the same style as {USER_NAME}'s past writing.",
         input=resolved_messages, 
         stream=True, 
     )
