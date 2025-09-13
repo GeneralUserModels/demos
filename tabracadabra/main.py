@@ -266,11 +266,24 @@ def loading_spinner(first_piece_event: threading.Event, cancel_event: threading.
         while not first_piece_event.is_set() and not cancel_event.is_set():
             if wait_with_checks(INTERVAL):
                 break
+
             # swap just the spinner glyph (keep placeholder)
             press_backspace(1)
             state["inserted_len"] -= 1
-            type_text(FRAMES[(idx + 1) % len(FRAMES)])
+            # Reflect that only the JOINER remains on screen right now
+            state["spinner_count"] = max(0, state["spinner_count"] - 1)
+
+            # Bail if content/cleanup started during the swap to avoid typing after cleanup
+            if first_piece_event.is_set() or cancel_event.is_set():
+                break
+
+            # Re-type next glyph
+            next_frame = FRAMES[(idx + 1) % len(FRAMES)]
+            type_text(next_frame)
             state["inserted_len"] += 1
+            # JOINER + glyph are present again
+            state["spinner_count"] += 1
+
             idx = (idx + 1) % len(FRAMES)
     finally:
         state["spinner_active"] = False
