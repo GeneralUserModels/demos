@@ -18,6 +18,8 @@ Tabracadabra 🎉 is a system-wide AI autocomplete that lets you summon intellig
 
 ## Setup
 
+0. Install and setup the General User Model. See the instructions at [https://generalusermodels.github.io/gum/](https://generalusermodels.github.io/gum/).
+
 1. Set up your environment:
    ```bash
    cp .env.example .env
