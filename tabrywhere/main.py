@@ -39,6 +39,8 @@ USER_NAME = os.getenv("USER_NAME")
 
 JOINER = "\u2060"  # WORD JOINER (plays nice with Backspace)
 
+HOLD_THRESHOLD = float(os.getenv("HOLD_THRESHOLD", "1.0"))  # seconds for Tab hold activation
+
 with open("tab_prompt.txt", "r") as f:
     TAB_PROMPT = f.read().format(USER_NAME=USER_NAME)
 
@@ -65,7 +67,6 @@ def _annotate_with_cursor(img: Image.Image, mon: dict, mx: int, my: int) -> Imag
     cy = max(0, min(cy, img.height - 1))
 
     # Estimate DPI (pixels per inch)
-    # mss monitor info might include 'width_mm' and 'height_mm'; if not, fallback
     width_mm = mon.get("width_mm")
     height_mm = mon.get("height_mm")
     if width_mm and height_mm:
@@ -137,25 +138,32 @@ def build_messages():
         {"role": "user", "content": [{"type": "input_image", "image_url": data_url}, {"type": "input_text", "text": TAB_PROMPT}]},
     ]
 
-# ------------- Keycodes / Flags -------------
+# ------------- Keycodes -------------
 KC_TAB = 48       # 0x30
 KC_BACKSPACE = 51 # 0x33
-FN_FLAG = getattr(Quartz, "kCGEventFlagMaskSecondaryFn", 0x00080000)
 
 # ------------- Tagging for our own events -------------
 OUR_EVENT_TAG = 0xC0DEFEED
 
 # ------------- State -------------
 state = {
-    "fn_down": False,
-    "session_active": False,
-    "inserted_len": 0,
-    "keep_contents": False,
+    "session_active": False,      # streaming session is running
+    "inserted_len": 0,            # how many chars we've injected into the app
+    "keep_contents": False,       # commit vs erase on release
     "stream_thread": None,
-    "cancel_event": None,
-    "spinner_count": 0,          # placeholder + glyph
-    "last_char_space": False,    # for boundary de-dupe
-    "content_started": False,    # becomes True at first token (after spinner cleanup)
+    "cancel_event": None,         # cancel the spinner/stream
+    "spinner_count": 0,           # placeholder + glyph
+    "last_char_space": False,
+    "content_started": False,     # True after first model token typed
+
+    # Tab-hold detection
+    "tab_down": False,
+    "tab_down_t0": 0.0,
+    "activated": False,           # became a "hold" (>= threshold) and started streaming
+    "activation_timer": None,
+    "first_piece_event": None,
+    "spinner_thread": None,
+    "spinner_active": False,
 }
 
 # Global I/O lock
@@ -181,12 +189,10 @@ def _keyboard_text_insert(s: str):
     src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStatePrivate)
     with io_lock:
         down = Quartz.CGEventCreateKeyboardEvent(src, 0, True)
-        # Send the whole chunk at once
         Quartz.CGEventKeyboardSetUnicodeString(down, len(s), s)
         _post_event(down)
 
         up = Quartz.CGEventCreateKeyboardEvent(src, 0, False)
-        # DO NOT set a Unicode payload on keyUp
         _post_event(up)
 
 def type_text(s: str):
@@ -237,34 +243,37 @@ def loading_spinner(first_piece_event: threading.Event, cancel_event: threading.
     Shows JOINER + spinner glyph until first token or cancel.
     Cleanup is handled elsewhere.
     """
-    FRAMES = ["◐", "◓", "◑", "◒"]
-    INTERVAL = 0.12
+    try:
+        FRAMES = ["◐", "◓", "◑", "◒"]
+        INTERVAL = 0.12
 
-    # Seed with placeholder + first frame
-    type_text(JOINER + FRAMES[0])
-    state["inserted_len"] += 2
-    state["spinner_count"] = 2
-    state["last_char_space"] = False
+        # Seed with placeholder + first frame
+        type_text(JOINER + FRAMES[0])
+        state["inserted_len"] += 2
+        state["spinner_count"] = 2
+        state["last_char_space"] = False
 
-    idx = 0
+        idx = 0
 
-    def wait_with_checks(seconds: float) -> bool:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if first_piece_event.is_set() or cancel_event.is_set():
-                return True
-            time.sleep(0.02)
-        return False
+        def wait_with_checks(seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if first_piece_event.is_set() or cancel_event.is_set():
+                    return True
+                time.sleep(0.02)
+            return False
 
-    while not first_piece_event.is_set() and not cancel_event.is_set():
-        if wait_with_checks(INTERVAL):
-            break
-        # swap just the spinner glyph (keep placeholder)
-        press_backspace(1)
-        state["inserted_len"] -= 1
-        type_text(FRAMES[(idx + 1) % len(FRAMES)])
-        state["inserted_len"] += 1
-        idx = (idx + 1) % len(FRAMES)
+        while not first_piece_event.is_set() and not cancel_event.is_set():
+            if wait_with_checks(INTERVAL):
+                break
+            # swap just the spinner glyph (keep placeholder)
+            press_backspace(1)
+            state["inserted_len"] -= 1
+            type_text(FRAMES[(idx + 1) % len(FRAMES)])
+            state["inserted_len"] += 1
+            idx = (idx + 1) % len(FRAMES)
+    finally:
+        state["spinner_active"] = False
 
 # ------------- GUM init + tool definition -------------
 gum_instance: Optional[GumClass] = None
@@ -363,30 +372,21 @@ def _cleanup_spinner_if_present():
         state["spinner_count"] = 0
         state["last_char_space"] = False
 
-def stream_worker(cancel_event: threading.Event):
+def stream_worker(cancel_event: threading.Event, first_piece_event: threading.Event):
     """
     1) Resolve tools.
     2) Stream and type content.
-    Cleanup of spinner happens either:
-      - just before the first content is typed, or
-      - on commit/cancel if no content ever started.
+    Spinner is started on Tab keydown; we only clear it when first content arrives.
     """
     messages = build_messages()
 
-    # Start loading spinner
-    first_piece_event = threading.Event()
-    spinner = threading.Thread(target=loading_spinner, args=(first_piece_event, cancel_event), daemon=True)
-    spinner.start()
-
     # ---- Phase 1: resolve tools ----
     resolved_messages = list(messages)
-    # max_tool_rounds = 4 # disabled for now
- 
     pre = client.responses.create(
-        model=MODEL, 
-        input=resolved_messages, 
+        model=MODEL,
+        input=resolved_messages,
         tool_choice="required",
-        tools=TOOLS, 
+        tools=TOOLS,
     )
 
     resolved_messages += pre.output
@@ -394,7 +394,6 @@ def stream_worker(cancel_event: threading.Event):
     for item in pre.output:
         if item.type == "function_call":
             if item.name == "get_user_context":
-
                 user_context = get_user_context_tool_call(item.arguments)
                 resolved_messages.append({
                     "type": "function_call_output",
@@ -402,27 +401,12 @@ def stream_worker(cancel_event: threading.Event):
                     "output": user_context
                 })
 
-
-    instructions = f"""Respond with a helpful continuation for the textbox in the image."""
-
-    resolved_messages.append({
-        "role": "user",
-        "content": [
-            {
-                "type": "input_text",
-                "text": instructions
-            }
-        ]
-    })
-
+    instructions = "Respond with a helpful continuation for the textbox in the image."
+    resolved_messages.append({"role": "user", "content": [{"type": "input_text", "text": instructions}]})
 
     # ---- Phase 2: stream ----
     first_piece_seen_local = False
-    stream =client.responses.create(
-        model=MODEL, 
-        input=resolved_messages, 
-        stream=True, 
-    )
+    stream = client.responses.create(model=MODEL, input=resolved_messages, stream=True)
     try:
         for chunk in stream:
             if cancel_event.is_set():
@@ -436,7 +420,6 @@ def stream_worker(cancel_event: threading.Event):
                 first_piece_seen_local = True
                 # Stop spinner and wait so no interleaving
                 first_piece_event.set()
-                spinner.join()
                 # Cleanup spinner before typing first content
                 _cleanup_spinner_if_present()
                 state["content_started"] = True
@@ -445,11 +428,38 @@ def stream_worker(cancel_event: threading.Event):
     finally:
         first_piece_event.set()
 
-# ------------- Stream Session Control -------------
-def handle_fn_down():
-    if state["session_active"]:
-        return
+# ------------- Tab-based control -------------
+def _start_spinner(cancel_event: threading.Event, first_piece_event: threading.Event):
+    state["spinner_active"] = True
+    t = threading.Thread(target=loading_spinner, args=(first_piece_event, cancel_event), daemon=True)
+    t.start()
+    state["spinner_thread"] = t
+
+def _start_stream():
+    # assumes spinner already running
     state["session_active"] = True
+    t = threading.Thread(target=stream_worker, args=(state["cancel_event"], state["first_piece_event"]), daemon=True)
+    state["stream_thread"] = t
+    t.start()
+
+def _activation_timer_body(start_t: float, cancel_event: threading.Event):
+    # Wait until threshold; if still held, activate
+    while True:
+        if cancel_event.is_set() or not state["tab_down"]:
+            return
+        if time.monotonic() - start_t >= HOLD_THRESHOLD:
+            if not state["activated"]:
+                state["activated"] = True
+                _start_stream()
+            return
+        time.sleep(0.01)
+
+def handle_tab_down():
+    if state["tab_down"]:
+        return
+    state["tab_down"] = True
+    state["tab_down_t0"] = time.monotonic()
+    state["activated"] = False
     state["keep_contents"] = False
     state["inserted_len"] = 0
     state["spinner_count"] = 0
@@ -458,33 +468,71 @@ def handle_fn_down():
 
     cancel = threading.Event()
     state["cancel_event"] = cancel
+    first_piece_event = threading.Event()
+    state["first_piece_event"] = first_piece_event
 
-    t = threading.Thread(target=stream_worker, args=(cancel,), daemon=True)
-    state["stream_thread"] = t
-    t.start()
+    # Start spinner immediately on press
+    _start_spinner(cancel, first_piece_event)
 
-def stop_stream(join: bool = True):
+    # Arm activation timer (pass local cancel_event to avoid races)
+    at = threading.Thread(target=_activation_timer_body, args=(state["tab_down_t0"], cancel), daemon=True)
+    state["activation_timer"] = at
+    at.start()
+
+def _synthesize_tab_keypress():
+    # Generate a real Tab hardware press, not a Unicode \t (more compatible)
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStatePrivate)
+    down = Quartz.CGEventCreateKeyboardEvent(src, KC_TAB, True)
+    _post_event(down)
+    up = Quartz.CGEventCreateKeyboardEvent(src, KC_TAB, False)
+    _post_event(up)
+
+def _stop_stream(join: bool = True):
     if state["cancel_event"]:
         state["cancel_event"].set()
     if join and state["stream_thread"] and state["stream_thread"].is_alive():
         state["stream_thread"].join(timeout=0.5)
     state["stream_thread"] = None
-    state["cancel_event"] = None
+    # leave cancel_event clearing to spinner cleanup path
 
-def handle_fn_up():
-    if not state["session_active"]:
+def _stop_spinner_and_cleanup():
+    # signal stop
+    if state["cancel_event"] and not state["cancel_event"].is_set():
+        state["cancel_event"].set()
+    # join spinner thread if present
+    t = state.get("spinner_thread")
+    if t and t.is_alive():
+        t.join(timeout=0.5)
+    # erase any spinner chars left
+    _cleanup_spinner_if_present()
+    # clear refs
+    state["spinner_thread"] = None
+
+def handle_tab_up():
+    if not state["tab_down"]:
         return
-    # Early release = cancel & erase everything inserted
-    stop_stream(join=True)
-    if not state["keep_contents"] and state["inserted_len"] > 0:
-        press_backspace(state["inserted_len"])
-    # Reset state
-    state["session_active"] = False
-    state["inserted_len"] = 0
-    state["keep_contents"] = False
-    state["spinner_count"] = 0
-    state["last_char_space"] = False
+
+    state["tab_down"] = False
+    was_activated = state["activated"]
+
+    if not was_activated:
+        # Quick tap: stop spinner first, then synthesize a real Tab
+        _stop_spinner_and_cleanup()
+        _synthesize_tab_keypress()
+    else:
+        # Streaming: commit and stop stream
+        state["keep_contents"] = True
+        _stop_stream(join=False)
+        if not state["content_started"]:
+            _stop_spinner_and_cleanup()
+
+    # reset transient flags AFTER cleanup to avoid races
+    state["activation_timer"] = None
+    state["first_piece_event"] = None
     state["content_started"] = False
+    state["inserted_len"] = 0
+    state["last_char_space"] = False
+    state["cancel_event"] = None
 
 # ------------- Event Tap Callback -------------
 def callback(proxy, event_type, event, refcon):
@@ -496,41 +544,33 @@ def callback(proxy, event_type, event, refcon):
             Quartz.CGEventTapEnable(tap_ref, True)
         return event
 
-    # Track Fn changes
-    if event_type == Quartz.kCGEventFlagsChanged:
-        flags = Quartz.CGEventGetFlags(event)
-        fn_now = bool(flags & FN_FLAG)
-        if fn_now and not state["fn_down"]:
-            state["fn_down"] = True
-            handle_fn_down()
-        elif not fn_now and state["fn_down"]:
-            state["fn_down"] = False
-            handle_fn_up()
-        return event
-
-    # Swallow real key events while Fn is down; let our own tagged events pass.
+    # Only key events matter now
     if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
         tag = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
         is_ours = (tag == OUR_EVENT_TAG)
 
-        if state["fn_down"] and not is_ours:
+        # Always pass through our own synthetic events
+        if is_ours:
+            return event
+
+        keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+
+        # Intercept ALL physical Tab events (including autorepeat)
+        if keycode == KC_TAB:
             if event_type == Quartz.kCGEventKeyDown:
-                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
                 autorepeat = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat)
+                # Run handle_tab_down only on the first non-autorepeat, but always swallow
+                if not autorepeat and not state["tab_down"]:
+                    handle_tab_down()
+                return None  # swallow hardware Tab down (and repeats)
+            else:  # KeyUp
+                handle_tab_up()
+                return None  # swallow hardware Tab up
 
-                # Fn+Tab → commit
-                if keycode == KC_TAB and not autorepeat:
-                    if not state.get("content_started", False):
-                        _cleanup_spinner_if_present()  # ensure nothing remains
-                        state["inserted_len"] = 0
-                    state["keep_contents"] = True
-                    stop_stream(join=False)
-                    return None
-            # Swallow all other hardware key events while Fn held
-            return None
-
+        # Let other keys pass through normally
         return event
 
+    # Ignore other event types
     return event
 
 # ------------- Main -------------
@@ -543,8 +583,7 @@ def main():
     except Exception as e:
         print(f"Warning: GUM failed to initialize now. Will retry on first use. Error: {e}")
 
-    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) |
-            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) |
+    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) |
             Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp))
     tap_ref = Quartz.CGEventTapCreate(
         Quartz.kCGSessionEventTap,
@@ -561,7 +600,7 @@ def main():
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap_ref, True)
 
-    print("Hold Fn to stream. Fn+Tab commits. Release Fn to cancel and erase. Ctrl+C to quit.")
+    print("Hold Tab to stream. Quick tap inserts a normal Tab. Ctrl+C to quit.")
     Quartz.CFRunLoopRun()
 
 if __name__ == "__main__":
