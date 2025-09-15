@@ -570,6 +570,16 @@ def callback(proxy, event_type, event, refcon):
 
         # Intercept ALL physical Tab events (including autorepeat)
         if keycode == KC_TAB:
+            # Check for modifier keys (Command, Option, Control, Shift)
+            flags = Quartz.CGEventGetFlags(event)
+            cmd_pressed = bool(flags & Quartz.kCGEventFlagMaskCommand)
+            opt_pressed = bool(flags & Quartz.kCGEventFlagMaskAlternate)
+            ctrl_pressed = bool(flags & Quartz.kCGEventFlagMaskControl)
+            
+            # Allow Command-Tab, Option-Tab, and Control-Tab to pass through
+            if cmd_pressed or opt_pressed or ctrl_pressed:
+                return event  # Let system handle app switching and other shortcuts
+            
             if event_type == Quartz.kCGEventKeyDown:
                 autorepeat = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat)
                 # Run handle_tab_down only on the first non-autorepeat, but always swallow
